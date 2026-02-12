@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::ir441::nodes::*;
 
@@ -111,6 +111,10 @@ struct Memory<'a> {
     /// Allocated object addresses, used to filter GC roots without a stack map.
     /// This does result in semi-conservative GC since we can occasionally mistake an int for a valid pointer, but it's unlikely to persist beyond a single GC cycle.
     allocations: HashSet<u64>,
+    /// Optional debug information tracking field names for each offset
+    fieldnames: Option<Vec<&'a str>>,
+    /// Optional class table information
+    classmeta: Option<Vec<(&'a str, &'a str, &'a str)>>,
 }
 type Locals<'a> = HashMap<&'a str, VirtualVal<'a>>;
 type Globals<'a> = HashMap<&'a str, u64>;
@@ -121,13 +125,27 @@ impl<'a> Memory<'a> {
         let mut next_free: u64 = 32;
         let mut m: BTreeMap<u64, VirtualVal<'a>> = BTreeMap::new();
         let mut globs: Globals = HashMap::new();
+        let mut classdata: Option<Vec<(&str, &str, &str)>> = None;
+        let mut fieldinfo: Option<Vec<&str>> = None;
 
         for g in prog.globals.iter() {
-            let GlobalStatic::Array { name: n, vals: vs } = g;
-            globs.insert(n, next_free);
-            for v in vs.iter() {
-                m.insert(next_free, v.clone());
-                next_free = next_free + 8;
+            match g {
+                GlobalStatic::Array { name: n, vals: vs } => {
+                    if *n == "_" {
+                        panic!("Globals may not be named '_'")
+                    }
+                    globs.insert(n, next_free);
+                    for v in vs.iter() {
+                        m.insert(next_free, v.clone());
+                        next_free = next_free + 8;
+                    }
+                }
+                GlobalStatic::DebugFieldNames { names } => {
+                    fieldinfo = Some((*names).clone());
+                }
+                GlobalStatic::DebugClassMeta { classinfo } => {
+                    classdata = Some((*classinfo).clone());
+                }
             }
         }
 
@@ -139,6 +157,8 @@ impl<'a> Memory<'a> {
             slot_cap,
             slots_alloced: 0,
             allocations: HashSet::new(),
+            classmeta: classdata,
+            fieldnames: fieldinfo,
         };
         (mem, globs)
     }
@@ -396,12 +416,62 @@ impl<'a> Memory<'a> {
 
     fn print(&self, _prog: &'a IRProgram, globs: &'a Globals<'a>) {
         println!("Global Addresses:");
+        let mut global_allocs_map = BTreeMap::new();
         for (name, addr) in globs.iter() {
-            println!("\t@{} -> {}", name, addr)
+            println!("\t@{} -> {}", name, addr);
+            global_allocs_map.insert(*addr, *name);
         }
+        let mut global_allocs: VecDeque<&str> = global_allocs_map.into_values().collect();
+
+        // Build type information
+        let mut offset_to_field: HashMap<usize, &str> = HashMap::new();
+        if let Some(fieldnames) = &self.fieldnames {
+            for (off, fname) in fieldnames.iter().enumerate() {
+                offset_to_field.insert(off, *fname);
+            }
+        }
+        let mut classinfo = HashMap::new();
+        if let Some(classdata) = &self.classmeta {
+            for (cname, vtname, fmname) in classdata {
+                if let Some(vtable_addr) = globs.get(*vtname) {
+                    // Found the vtable. May or may not have a field map.
+                    let mut offsetmap = None;
+                    if *fmname != "_" {
+                        let mut map = HashMap::new();
+                        // TODO: Restructure the global representation as a map instead of a vector
+                        for g in &_prog.globals {
+                            if let GlobalStatic::Array { name, vals } = g
+                                && *name == *fmname
+                            {
+                                for (index, field_offset) in vals.iter().enumerate() {
+                                    if field_offset.as_u64().unwrap() != 0 {
+                                        map.insert(
+                                            field_offset.as_u64().unwrap(),
+                                            offset_to_field.get(&index).unwrap(),
+                                        );
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        offsetmap = Some(map);
+                    }
+                    classinfo.insert(*vtable_addr, (*cname, offsetmap, *fmname));
+                } else {
+                    eprintln!(
+                        "Warning: Could not find vtable named {} to match debug info for class {}",
+                        *vtname, *cname
+                    );
+                }
+            }
+        }
+
         println!("Memory Contents:");
         let mut split_globals = false;
         let mut split_gcspace = false;
+        let mut last_object_base: u64 = 0;
+        let mut last_object_field_info = &None;
+        let mut last_object_fmap_name = None;
         for (addr, val) in self.map.iter() {
             if !split_globals && *addr > self.first_writable {
                 println!("\t---------------- <end of globals, start of mutable memory>");
@@ -413,7 +483,92 @@ impl<'a> Memory<'a> {
                 );
                 split_gcspace = true;
             }
-            println!("\t{}: {}", addr, val);
+
+            let valwidth: usize = 20; // TODO: calculate based on longest block name
+
+            // Printing cells of the last global, the vecdeque is empty
+            if *addr <= self.first_writable && global_allocs.len() > 0 {
+                if let Some(v) = globs.get(global_allocs.get(0).unwrap())
+                    && *v == *addr
+                {
+                    println!("    Start of global '{}'", global_allocs.get(0).unwrap());
+                    global_allocs.pop_front();
+                }
+            }
+
+            // Note: We pre-format! the value so that printf's alignment works --- alignment is apparently a property
+            // of the type being formatted, so by converting to a string first we ensure we can align
+            if let VirtualVal::CodePtr { .. } = val {
+                println!(
+                    "\t{}: {:.>valwidth$}\t(Block/code pointer)",
+                    addr,
+                    format!("{}", val)
+                );
+            } else if let VirtualVal::Data { val: v } = val
+                && let Some((cname, finfo, fmname)) = classinfo.get(v)
+            {
+                println!(
+                    "\t{}: {:.>valwidth$}\t(Object header for class '{}')",
+                    addr,
+                    format!("{}", val),
+                    *cname
+                );
+                last_object_base = *addr;
+                last_object_field_info = finfo;
+                last_object_fmap_name = Some(*fmname);
+            } else if let VirtualVal::Data { val: v } = val
+                && last_object_base == *addr - 8
+            {
+                if let Some(fmname) = last_object_fmap_name {
+                    // If running with field maps, this is the fieldmap.
+                    if fmname == "_" {
+                        // No field map, print normally
+                        println!("\t{}: {:.>valwidth$}", addr, format!("{}", val));
+                    } else {
+                        // Field maps exist
+                        if let Some(fmap_addr) = globs.get(fmname)
+                            && fmap_addr == v
+                        {
+                            println!(
+                                "\t{}: {:.>valwidth$}\t(field map {})",
+                                addr,
+                                format!("{}", val),
+                                fmname
+                            );
+                        } else {
+                            println!(
+                                "\t{}: {:.>valwidth$}\t(*should* be field map {}, but appears corrupted)",
+                                addr,
+                                format!("{}", val),
+                                fmname
+                            );
+                        }
+                    }
+                } else {
+                    panic!(
+                        "Inconsistent data structures: empty last_object_fmap_name despite non-trivial last_object_base {}",
+                        last_object_base
+                    );
+                }
+            } else if let VirtualVal::Data { val: v } = val
+                && let Some(reverse_fmap) = last_object_field_info
+                && let Some(&fname) = reverse_fmap.get(&((addr - last_object_base) / 8))
+            {
+                // Not an object header, but we have current object info and the field name
+                println!(
+                    "\t{}: {:.>valwidth$}\t(.{})",
+                    addr,
+                    format!("{}", val),
+                    *fname
+                );
+            } else {
+                // No class info for this
+                println!(
+                    "\t{}: {:.>valwidth$}\t(No debugging info available!)",
+                    addr,
+                    format!("{}", val)
+                );
+            }
         }
     }
 }
@@ -526,16 +681,18 @@ fn expr_val<'a>(
     }
 }
 
-// Run one basic block to completion. We abuse the Rust stack to encode the target code stack, so don't be on tail call optimization in interpreted code.
+// Run one basic block's function to completion. We abuse the Rust stack to encode the target code stack, so don't be on tail call optimization in interpreted code.
 fn run_code<'a>(
     prog: &'a IRProgram<'a>,
-    mut cur_block: &'a BasicBlock<'a>,
+    entry_block: &'a BasicBlock<'a>,
     locs: &mut Vec<Locals<'a>>,
     globs: &mut Globals<'a>,
     m: &mut Memory<'a>,
     tracing: bool,
+    memdump: bool,
     mut cycles: &mut ExecStats,
 ) -> Result<VirtualVal<'a>, RuntimeError<'a>> {
+    let mut cur_block = entry_block;
     let localsindex = locs.len() - 1;
     // on entry no previous block
     let mut prevblock: Option<&'a str> = None;
@@ -659,9 +816,23 @@ fn run_code<'a>(
                     }
                     cycles.call();
                     locs.push(calleevars);
-                    let callresult =
-                        run_code(prog, target_block, locs, globs, m, tracing, &mut cycles)?;
+                    let callresult = run_code(
+                        prog,
+                        target_block,
+                        locs,
+                        globs,
+                        m,
+                        tracing,
+                        memdump,
+                        &mut cycles,
+                    )?;
                     locs.pop();
+                    if tracing {
+                        println!(
+                            "Call to {:?} returned {:?}, storing into %{:?}",
+                            target_block.name, callresult, dest
+                        );
+                    }
                     set_var(&mut locs[localsindex], dest, callresult)
                 }
                 IRStatement::SetElt {
@@ -948,11 +1119,16 @@ fn run_code<'a>(
             }
         }
     }
+    if memdump {
+        println!("Dumping memory on exit from {:?}\n", entry_block.name);
+        m.print(prog, &globs);
+    }
     Ok(finalresult.unwrap())
 }
 pub fn run_prog<'a>(
     prog: &'a IRProgram,
     tracing: bool,
+    memdump: bool,
     mut cycles: &mut ExecStats,
     cap: ExecMode,
 ) -> Result<VirtualVal<'a>, RuntimeError<'a>> {
@@ -975,6 +1151,7 @@ pub fn run_prog<'a>(
         &mut globs,
         &mut m,
         tracing,
+        memdump,
         &mut cycles,
     );
     match &fresult {
