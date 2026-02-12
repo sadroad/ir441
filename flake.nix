@@ -35,7 +35,7 @@
       packages = forEachSystem (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "ir441";
-          version = "2.2.1";
+          version = "2.2.3";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
         };
